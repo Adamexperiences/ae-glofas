@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       years:
-        description: "Years (range like 2015-2024 or comma list)"
+        description: "Years (range like 2015-2024)"
         default: "2015-2024"
       pctl:
         description: "Low-flow percentile threshold"
@@ -12,7 +12,7 @@ on:
         description: "JSON array of gauges to pull"
         default: '["kaub","maxau","koln","basel","lobith","pfelling","kienstock","wildungsmauer","budapest","mohacs","giurgiu"]'
       outfile:
-        description: "Output JSON path (use data/baseline-extra.json for a parallel add)"
+        description: "Output JSON path"
         default: "data/baseline.json"
 permissions:
   contents: write
@@ -20,10 +20,11 @@ jobs:
   pull:
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 6
       matrix:
         gauge: ${{ fromJSON(inputs.gauges) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -67,28 +68,29 @@ jobs:
               if "-" in s:
                   a, b = s.split("-"); return list(range(int(a), int(b) + 1))
               return [int(x) for x in s.split(",") if x.strip()]
-          YEARS = parse_years(os.environ.get("YEARS", "2010-2024"))
+          YEARS = parse_years(os.environ.get("YEARS", "2015-2024"))
           
           c = cdsapi.Client()
           MONTHS = [f"{m:02d}" for m in range(1, 13)]
           DAYS = [f"{d:02d}" for d in range(1, 32)]
           
-          def pull_year(area, year):
+          def pull_all(area, years):
+              # ONE request for ALL years at once
               for fmt, ext in (("netcdf4", "nc"), ("grib2", "grib")):
                   try:
                       req = {
                           "system_version":["version_4_0"], "hydrological_model":["lisflood"],
                           "product_type":["consolidated"], "timespan":["time_mean"],
                           "variable":["average_river_discharge_in_the_last_24_hours"],
-                          "year":[str(year)], "month":MONTHS, "day":DAYS,
+                          "year":[str(y) for y in years], "month":MONTHS, "day":DAYS,
                           "data_format":fmt, "download_format":"unarchived", "area":area,
                       }
-                      tgt = f"h_{year}.{ext}"
+                      tgt = f"h_all.{ext}"
                       c.retrieve("cems-glofas-historical", req, tgt)
                       if zipfile.is_zipfile(tgt):
                           with zipfile.ZipFile(tgt) as z:
-                              z.extractall(f"x{year}")
-                              cand = [os.path.join(f"x{year}", n) for n in z.namelist() if n.endswith((".nc",".grib",".grib2"))]
+                              z.extractall("xall")
+                              cand = [os.path.join("xall", n) for n in z.namelist() if n.endswith((".nc",".grib",".grib2"))]
                               tgt = cand[0] if cand else tgt
                       import xarray as xr
                       eng = "netcdf4" if tgt.endswith(".nc") else "cfgrib"
@@ -103,17 +105,16 @@ jobs:
                       cube = da.transpose(timen, latn, lonn).values
                       return dates, cube, da[latn].values, da[lonn].values
                   except Exception as e:
-                      print(f"[{fmt}] {year} failed: {repr(e)[:160]}", flush=True)
-              raise RuntimeError(f"all formats failed {year}")
+                      print(f"[{fmt}] failed: {repr(e)[:200]}", flush=True)
+              raise RuntimeError("all formats failed")
           
-          area = [round(g["lat"]+0.12,3), round(g["lon"]-0.12,3), round(g["lat"]-0.12,3), round(g["lon"]+0.12,3)]
-          all_dates=[]; cubes=[]; lats=lons=None
-          for y in YEARS:
-              d, cube, la, lo = pull_year(area, y); all_dates += d; cubes.append(cube); lats, lons = la, lo
-          full = np.concatenate(cubes, axis=0)
+          # small box (~3x3 cells) to keep 10yr request well under the CDS field cap
+          area = [round(g["lat"]+0.075,3), round(g["lon"]-0.075,3), round(g["lat"]-0.075,3), round(g["lon"]+0.075,3)]
+          dates, cube, lats, lons = pull_all(area, YEARS)
+          d = np.array(dates); full = cube.astype(float)
           meanmap = np.nanmean(full, axis=0)
           ij = np.unravel_index(np.nanargmax(meanmap), meanmap.shape)
-          s = full[:, ij[0], ij[1]].astype(float); d = np.array(all_dates)
+          s = full[:, ij[0], ij[1]]
           thr = float(np.nanpercentile(s, PCTL))
           months = np.array([int(x[5:7]) for x in d])
           clim = [{"m":m, "as_planned": (round(float(np.mean(s[months==m] >= thr)),3) if (months==m).any() else None)} for m in range(1,13)]
@@ -124,7 +125,6 @@ jobs:
                  "series":{"dates":list(d), "flow":[int(round(v)) for v in s]}}
           json.dump({GAUGE:rec}, open(f"{GAUGE}.json", "w"))
           print(f"{GAUGE}: cell {rec['cell']} thr(p{PCTL:g})={thr:.0f} mean={rec['mean_flow']:.0f} days={s.size}", flush=True)
-          print("monthly:", [cc["as_planned"] for cc in clim], flush=True)
           PYEOF
           python baseline_one.py
       - uses: actions/upload-artifact@v4
@@ -132,8 +132,10 @@ jobs:
           name: bl-${{ matrix.gauge }}
           path: ${{ matrix.gauge }}.json
           retention-days: 7
+          if-no-files-found: ignore
   merge:
     needs: pull
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -172,6 +174,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$OUTFILE"
-          git commit -m "baseline: ${{ inputs.gauges }} -> $OUTFILE" || echo "no change"
+          git commit -m "baseline fast: ${{ inputs.gauges }} -> $OUTFILE" || echo "no change"
           git pull --rebase --autostash || true
           git push
