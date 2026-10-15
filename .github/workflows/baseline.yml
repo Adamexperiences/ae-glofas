@@ -64,7 +64,7 @@ jobs:
                           "system_version":["version_4_0"], "hydrological_model":["lisflood"],
                           "product_type":["consolidated"], "timespan":["time_mean"],
                           "variable":["average_river_discharge_in_the_last_24_hours"],
-                          "hyear":[str(year)], "hmonth":MONTHS, "hday":DAYS,
+                          "year":[str(year)], "month":MONTHS, "day":DAYS,
                           "data_format":fmt, "download_format":"unarchived", "area":area,
                       }
                       tgt = f"hist_{year}.{ext}"
