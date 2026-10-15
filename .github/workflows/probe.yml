@@ -1,0 +1,84 @@
+name: GloFAS probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install "cdsapi>=0.7.7" xarray netcdf4 cfgrib eccodes numpy
+      - name: Write CDS API config
+        env:
+          CDS_KEY: ${{ secrets.CDS_KEY }}
+        run: |
+          printf 'url: https://ewds.climate.copernicus.eu/api\nkey: %s\n' "$CDS_KEY" > "$HOME/.cdsapirc"
+          echo "Wrote ~/.cdsapirc (key hidden)"
+      - name: Run probe
+        run: |
+          cat > probe.py <<'PYEOF'
+          import cdsapi, os, zipfile, traceback
+          print("cdsapi version:", getattr(cdsapi, "__version__", "?"), flush=True)
+          c = cdsapi.Client()
+          AREA = [50.2, 7.6, 50.0, 7.9]  # N,W,S,E around Kaub (Rhine)
+
+          def openprint(target):
+              if zipfile.is_zipfile(target):
+                  with zipfile.ZipFile(target) as z:
+                      names = z.namelist(); print("  (zip) members:", names, flush=True)
+                      z.extractall("unz_" + target)
+                      cand = [os.path.join("unz_" + target, n) for n in names
+                              if n.endswith((".nc", ".grib", ".grib2", ".grb"))]
+                      target = cand[0] if cand else target
+              import xarray as xr
+              eng = "netcdf4" if target.endswith(".nc") else "cfgrib"
+              ds = xr.open_dataset(target, engine=eng)
+              print("  DIMS:", dict(ds.sizes), flush=True)
+              print("  COORDS:", list(ds.coords), flush=True)
+              print("  DATA_VARS:", list(ds.data_vars), flush=True)
+              for v in ds.data_vars:
+                  da = ds[v]
+                  print("   VAR", v, "dims", da.dims, "shape", da.shape, flush=True)
+                  try:
+                      print("    sample value:", float(da.values.flatten()[0]), flush=True)
+                  except Exception as e:
+                      print("    sample err", e, flush=True)
+              print(ds, flush=True)
+
+          def probe(name, dataset, request):
+              print("\n" + "=" * 70, flush=True)
+              print("PROBE:", name, "->", dataset, flush=True)
+              print("request:", request, flush=True)
+              for fmt, ext in (("netcdf4", "nc"), ("grib2", "grib")):
+                  try:
+                      req = dict(request); req["data_format"] = fmt; req["download_format"] = "unarchived"
+                      target = f"{name}.{ext}"
+                      c.retrieve(dataset, req, target)
+                      print(f"  downloaded {target}: {os.path.getsize(target)} bytes (format={fmt})", flush=True)
+                      openprint(target); return
+                  except Exception as e:
+                      print(f"  [{fmt}] FAILED: {repr(e)}", flush=True); traceback.print_exc()
+              print("  both formats failed for", name, flush=True)
+
+          probe("seasonal", "cems-glofas-seasonal", {
+              "system_version": ["operational"], "hydrological_model": ["lisflood"],
+              "variable": ["river_discharge_in_the_last_24_hours"],
+              "year": ["2026"], "month": ["10"],
+              "leadtime_hour": ["24", "48", "72", "96", "120"], "area": AREA,
+          })
+          probe("historical", "cems-glofas-historical", {
+              "system_version": ["version_4_0"], "hydrological_model": ["lisflood"],
+              "product_type": ["consolidated"],
+              "variable": ["river_discharge_in_the_last_24_hours"],
+              "year": ["2025"], "month": ["10"], "day": ["01"], "area": AREA,
+          })
+          print("\nPROBE DONE", flush=True)
+          PYEOF
+          python probe.py
