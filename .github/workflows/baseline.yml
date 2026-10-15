@@ -1,0 +1,134 @@
+name: GloFAS baseline builder
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install "cdsapi>=0.7.7" xarray netcdf4 cfgrib eccodes numpy
+      - name: Write CDS API config
+        env:
+          CDS_KEY: ${{ secrets.CDS_KEY }}
+        run: |
+          printf 'url: https://ewds.climate.copernicus.eu/api\nkey: %s\n' "$CDS_KEY" > "$HOME/.cdsapirc"
+      - name: Build baseline
+        env:
+          YEARS: "2023,2024"
+          GAUGES: "kaub,budapest"
+          PCTL: "10"
+        run: |
+          cat > baseline.py <<'PYEOF'
+          # GloFAS baseline builder: per-gauge trouble threshold + monthly climatology + daily
+          # series (for analog years), from the historical reanalysis. Occasional run.
+          import cdsapi, os, json, zipfile, glob, datetime, traceback
+          import numpy as np
+          
+          # Test knobs (env): YEARS="2022,2023,2024"  GAUGES="kaub,budapest"  PCTL=10
+          YEARS = [int(y) for y in os.environ.get("YEARS", "2022,2023,2024").split(",") if y.strip()]
+          ONLY  = set(g for g in os.environ.get("GAUGES", "").split(",") if g.strip())
+          PCTL  = float(os.environ.get("PCTL", "10"))
+          
+          GAUGES = {
+              "kaub":{"river":"rhine","lat":50.085,"lon":7.765},
+              "maxau":{"river":"rhine","lat":49.039,"lon":8.306},
+              "lobith":{"river":"rhine","lat":51.840,"lon":6.110},
+              "pfelling":{"river":"danube","lat":48.880,"lon":12.750},
+              "kienstock":{"river":"danube","lat":48.380,"lon":15.460},
+              "wildungsmauer":{"river":"danube","lat":48.120,"lon":16.920},
+              "budapest":{"river":"danube","lat":47.498,"lon":19.045},
+              "mohacs":{"river":"danube","lat":45.990,"lon":18.680},
+              "giurgiu":{"river":"danube","lat":43.900,"lon":25.970},
+          }
+          if ONLY:
+              GAUGES = {k:v for k,v in GAUGES.items() if k in ONLY}
+          
+          c = cdsapi.Client()
+          MONTHS = [f"{m:02d}" for m in range(1,13)]
+          DAYS   = [f"{d:02d}" for d in range(1,32)]
+          
+          def pull_year(area, year):
+              """Return (dates[list], cube[np.ndarray time,lat,lon], lats, lons) for one year."""
+              for fmt, ext, eng in (("netcdf4","nc","netcdf4"), ("grib2","grib","cfgrib")):
+                  try:
+                      req = {
+                          "system_version":["version_4_0"], "hydrological_model":["lisflood"],
+                          "product_type":["consolidated"],
+                          "variable":["river_discharge_in_the_last_24_hours"],
+                          "hyear":[str(year)], "hmonth":MONTHS, "hday":DAYS,
+                          "data_format":fmt, "download_format":"unarchived", "area":area,
+                      }
+                      tgt = f"hist_{year}.{ext}"
+                      c.retrieve("cems-glofas-historical", req, tgt)
+                      if zipfile.is_zipfile(tgt):
+                          with zipfile.ZipFile(tgt) as z:
+                              z.extractall(f"x_{year}")
+                              cand=[os.path.join(f"x_{year}",n) for n in z.namelist() if n.endswith((".nc",".grib",".grib2"))]
+                              tgt = cand[0] if cand else tgt
+                              eng = "netcdf4" if tgt.endswith(".nc") else "cfgrib"
+                      import xarray as xr
+                      ds = xr.open_dataset(tgt, engine=eng)
+                      var = "dis24" if "dis24" in ds.data_vars else list(ds.data_vars)[0]
+                      da = ds[var].squeeze()
+                      latn = [d for d in da.dims if "lat" in d.lower()][0]
+                      lonn = [d for d in da.dims if "lon" in d.lower()][0]
+                      timen = [d for d in da.dims if d not in (latn,lonn)][0]
+                      tvals = ds[timen].values if timen in ds.coords else da[timen].values
+                      dates = [str(np.datetime64(t,"D")) for t in np.atleast_1d(tvals)]
+                      cube = da.transpose(timen,latn,lonn).values
+                      return dates, cube, da[latn].values, da[lonn].values
+                  except Exception as e:
+                      print(f"   [{fmt}] {year} failed: {repr(e)[:160]}", flush=True)
+              raise RuntimeError(f"both formats failed for {year}")
+          
+          out = {"built": datetime.datetime.utcnow().isoformat()+"Z", "years":[min(YEARS),max(YEARS)],
+                 "pctl": PCTL, "gauges":{}}
+          
+          for name, g in GAUGES.items():
+              print("="*60, flush=True); print("GAUGE", name, g, flush=True)
+              area = [round(g["lat"]+0.12,3), round(g["lon"]-0.12,3), round(g["lat"]-0.12,3), round(g["lon"]+0.12,3)]
+              all_dates=[]; cubes=[]; lats=lons=None
+              try:
+                  for y in YEARS:
+                      d,cube,la,lo = pull_year(area,y)
+                      all_dates += d; cubes.append(cube); lats,lons = la,lo
+                  full = np.concatenate(cubes, axis=0)  # (time,lat,lon)
+                  meanmap = np.nanmean(full, axis=0)
+                  ij = np.unravel_index(np.nanargmax(meanmap), meanmap.shape)
+                  series = full[:, ij[0], ij[1]].astype(float)
+                  cell_lat = float(lats[ij[0]]); cell_lon = float(lons[ij[1]])
+                  s = np.array(series); d = np.array(all_dates)
+                  thr = float(np.nanpercentile(s, PCTL))
+                  months = np.array([int(x[5:7]) for x in d])
+                  clim = []
+                  for m in range(1,13):
+                      sel = s[months==m]
+                      ap = float(np.mean(sel >= thr)) if sel.size else None
+                      clim.append({"m":m, "as_planned": None if ap is None else round(ap,3)})
+                  out["gauges"][name] = {
+                      "river":g["river"], "lat":g["lat"], "lon":g["lon"],
+                      "cell":[round(cell_lat,3), round(cell_lon,3)],
+                      "unit":"m3/s", "threshold": round(thr,1),
+                      "mean_flow": round(float(np.nanmean(s)),1),
+                      "n_days": int(s.size),
+                      "monthly_climatology": clim,
+                      "series": {"dates": list(d), "flow": [int(round(v)) for v in s]},
+                  }
+                  print(f"  cell {cell_lat:.3f},{cell_lon:.3f}  thr(p{PCTL:g})={thr:.0f}  mean={np.nanmean(s):.0f}  days={s.size}", flush=True)
+                  print("  monthly as_planned:", [cc["as_planned"] for cc in clim], flush=True)
+              except Exception as e:
+                  print("  GAUGE FAILED:", repr(e), flush=True); traceback.print_exc()
+          
+          json.dump(out, open("baseline.json","w"))
+          print("\nWROTE baseline.json", os.path.getsize("baseline.json"), "bytes for", list(out["gauges"].keys()), flush=True)
+          PYEOF
+          python baseline.py
