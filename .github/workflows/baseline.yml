@@ -3,11 +3,17 @@ on:
   workflow_dispatch:
     inputs:
       years:
-        description: "Years (range like 2010-2024 or comma list)"
-        default: "2010-2024"
+        description: "Years (range like 2015-2024 or comma list)"
+        default: "2015-2024"
       pctl:
         description: "Low-flow percentile threshold"
         default: "10"
+      gauges:
+        description: "JSON array of gauges to pull"
+        default: '["kaub","maxau","koln","basel","lobith","pfelling","kienstock","wildungsmauer","budapest","mohacs","giurgiu"]'
+      outfile:
+        description: "Output JSON path (use data/baseline-extra.json for a parallel add)"
+        default: "data/baseline.json"
 permissions:
   contents: write
 jobs:
@@ -16,7 +22,7 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        gauge: [kaub, maxau, lobith, pfelling, kienstock, wildungsmauer, budapest, mohacs, giurgiu]
+        gauge: ${{ fromJSON(inputs.gauges) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
@@ -42,6 +48,8 @@ jobs:
           GAUGES = {
               "kaub":{"river":"rhine","lat":50.085,"lon":7.765},
               "maxau":{"river":"rhine","lat":49.039,"lon":8.306},
+              "koln":{"river":"rhine","lat":50.937,"lon":6.963},
+              "basel":{"river":"rhine","lat":47.559,"lon":7.590},
               "lobith":{"river":"rhine","lat":51.840,"lon":6.110},
               "pfelling":{"river":"danube","lat":48.880,"lon":12.750},
               "kienstock":{"river":"danube","lat":48.380,"lon":15.460},
@@ -133,24 +141,37 @@ jobs:
         with:
           path: artifacts
       - name: Merge
+        env:
+          OUTFILE: ${{ inputs.outfile }}
         run: |
           cat > merge.py <<'PYEOF'
           import json, glob, os, datetime
+          OUT = os.environ.get("OUTFILE", "data/baseline.json")
           out = {"built": datetime.datetime.utcnow().isoformat()+"Z", "gauges": {}}
+          if os.path.exists(OUT):
+              try:
+                  prev = json.load(open(OUT))
+                  out["gauges"].update(prev.get("gauges", {}))
+                  print("loaded existing gauges from", OUT, ":", list(out["gauges"].keys()), flush=True)
+              except Exception as e:
+                  print("existing", OUT, "unreadable, fresh:", e, flush=True)
           for f in sorted(glob.glob("artifacts/**/*.json", recursive=True)):
               try:
                   out["gauges"].update(json.load(open(f)))
               except Exception as e:
                   print("skip", f, e, flush=True)
-          os.makedirs("data", exist_ok=True)
-          json.dump(out, open("data/baseline.json", "w"))
-          print("merged gauges:", list(out["gauges"].keys()), "size", os.path.getsize("data/baseline.json"), flush=True)
+          os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
+          json.dump(out, open(OUT, "w"))
+          print("wrote", OUT, "gauges:", list(out["gauges"].keys()), "size", os.path.getsize(OUT), flush=True)
           PYEOF
           python merge.py
       - name: Commit
+        env:
+          OUTFILE: ${{ inputs.outfile }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/baseline.json
-          git commit -m "baseline: ${{ inputs.years }} (p${{ inputs.pctl }})" || echo "no change"
+          git add "$OUTFILE"
+          git commit -m "baseline: ${{ inputs.gauges }} -> $OUTFILE" || echo "no change"
+          git pull --rebase --autostash || true
           git push
