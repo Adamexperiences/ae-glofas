@@ -62,7 +62,7 @@ jobs:
                   try:
                       req = {
                           "system_version":["version_4_0"], "hydrological_model":["lisflood"],
-                          "product_type":["consolidated"],
+                          "product_type":["consolidated"], "timespan":["time_mean"],
                           "variable":["river_discharge_in_the_last_24_hours"],
                           "hyear":[str(year)], "hmonth":MONTHS, "hday":DAYS,
                           "data_format":fmt, "download_format":"unarchived", "area":area,
