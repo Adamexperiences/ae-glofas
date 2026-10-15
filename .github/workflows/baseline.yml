@@ -27,7 +27,7 @@ jobs:
       matrix:
         gauge: ${{ fromJSON(inputs.gauges) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 350
     steps:
       - uses: actions/setup-python@v5
         with:
