@@ -1,6 +1,11 @@
 name: GloFAS daily feed
 on:
   workflow_dispatch:
+    inputs:
+      gauges:
+        description: "Comma-separated gauge names to run (blank = all)"
+        required: false
+        default: ""
   schedule:
     - cron: "20 5 * * *"
 permissions:
@@ -24,6 +29,8 @@ jobs:
         run: |
           printf 'url: https://ewds.climate.copernicus.eu/api\nkey: %s\n' "$CDS_KEY" > "$HOME/.cdsapirc"
       - name: Build feed
+        env:
+          GAUGES: ${{ github.event.inputs.gauges }}
         run: |
           cat > glofas.py <<'PYEOF'
           # GloFAS daily feed: reads data/baseline.json, pulls the seasonal ensemble per gauge,
