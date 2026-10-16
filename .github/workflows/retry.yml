@@ -1,0 +1,35 @@
+name: GloFAS baseline retry (6h)
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+permissions:
+  actions: write
+  contents: read
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-dispatch baseline for any still-missing gauges
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          want="koln basel kienstock wildungsmauer budapest mohacs giurgiu"
+          have=$(curl -s "https://raw.githubusercontent.com/$REPO/main/data/baseline.json" | jq -r '.gauges | keys[]' 2>/dev/null || true)
+          miss=""
+          for g in $want; do
+            echo "$have" | grep -qx "$g" || miss="$miss \"$g\""
+          done
+          miss=$(echo "$miss" | sed 's/^ //')
+          if [ -z "$miss" ]; then
+            echo "All 7 gauges present in baseline.json - nothing to do."
+            exit 0
+          fi
+          arr="[$(echo "$miss" | sed 's/ /,/g')]"
+          echo "Missing gauges -> dispatching: $arr"
+          gh workflow run baseline.yml -R "$REPO" \
+            -f gauges="$arr" \
+            -f chunk=1 \
+            -f years=2020-2024 \
+            -f outfile=data/baseline.json
