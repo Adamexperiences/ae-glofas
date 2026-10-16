@@ -88,7 +88,7 @@ jobs:
                   cols = np.where(vm == m)[0]
                   block = arr[:, cols]
                   src = "forecast"
-                  if cols.size >= 10:   # enough lead coverage to trust the ensemble
+                  if cols.size >= 3:   # enough lead coverage to trust the ensemble
                       val = round(float(np.mean(block >= threshold)), 3)
                   else:
                       val = climmap.get(m); src = "climatology"
@@ -152,9 +152,9 @@ jobs:
               import cdsapi, xarray as xr
               c = cdsapi.Client()
               now = datetime.datetime.utcnow()
-              box = [round(cell_lat + 0.13, 3), round(cell_lon - 0.13, 3),
-                     round(cell_lat - 0.13, 3), round(cell_lon + 0.13, 3)]
-              leads = [str(h) for h in range(24, 24 * 7 * OUTLOOK_WEEKS + 1, 24)]
+              box = [round(cell_lat + 0.03, 3), round(cell_lon - 0.03, 3),
+                     round(cell_lat - 0.03, 3), round(cell_lon + 0.03, 3)]
+              leads = [str(h) for h in range(168, 168 * OUTLOOK_WEEKS + 1, 168)]
               req = {
                   "system_version": ["operational"], "hydrological_model": ["lisflood"],
                   "variable": ["river_discharge_in_the_last_24_hours"],
@@ -172,7 +172,7 @@ jobs:
               da = ds["dis24"] if "dis24" in ds.data_vars else ds[list(ds.data_vars)[0]]
               latn = [d for d in da.dims if "lat" in d.lower()][0]
               lonn = [d for d in da.dims if "lon" in d.lower()][0]
-              da = da.sel({latn: cell_lat, lonn: cell_lon}, method="nearest")
+              da = da.sel({latn: cell_lat, lohn: cell_lon}, method="nearest")
               memn = [d for d in da.dims if d not in (latn, lonn) and ("num" in d.lower() or "member" in d.lower() or "real" in d.lower())]
               memn = memn[0] if memn else [d for d in da.dims if d != da.dims[-1]][0]
               leadn = [d for d in da.dims if d != memn][-1]
