@@ -1,0 +1,241 @@
+name: GloFAS daily feed
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 5 * * *"
+permissions:
+  contents: write
+concurrency:
+  group: glofas-daily
+  cancel-in-progress: false
+jobs:
+  feed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install "cdsapi>=0.7.7" xarray "netcdf4" numpy
+      - name: CDS config
+        env:
+          CDS_KEY: ${{ secrets.CDS_KEY }}
+        run: |
+          printf 'url: https://ewds.climate.copernicus.eu/api\nkey: %s\n' "$CDS_KEY" > "$HOME/.cdsapirc"
+      - name: Build feed
+        run: |
+          cat > glofas.py <<'PYEOF'
+          # GloFAS daily feed: reads data/baseline.json, pulls the seasonal ensemble per gauge,
+          # and writes glofas.json (sail odds, predicted flow, analog years, monthly climatology,
+          # and optional predicted heights when data/ratings.json is present).
+          import os, json, zipfile, datetime, math
+          import numpy as np
+          
+          HORIZON_WEEKS = int(os.environ.get("HORIZON_WEEKS", "8"))   # glasses go to 8 weeks
+          OUTLOOK_WEEKS = int(os.environ.get("OUTLOOK_WEEKS", "30"))  # odds view ~7 months
+          BASELINE = os.environ.get("BASELINE", "data/baseline.json")
+          RATINGS  = os.environ.get("RATINGS", "data/ratings.json")
+          
+          # ---------- pure analytics (unit-tested offline) ----------
+          def pctile_of(value, series):
+              """Percentile rank (0-100) of value within a 1-D baseline flow series."""
+              s = np.asarray(series, float)
+              s = s[~np.isnan(s)]
+              if s.size == 0: return None
+              return round(float((s < value).mean() * 100), 1)
+          
+          def weekly_odds(arr, lead_days, threshold):
+              """arr: (members, leads) discharge. lead_days: lead time in days per column.
+              Returns list of {week, horizon_days, as_planned, med_flow, p25, p75, low, high}.
+              as_planned = fraction of (member,day) with flow >= threshold that week."""
+              arr = np.asarray(arr, float); lead_days = np.asarray(lead_days, float)
+              out = []
+              for w in range(1, OUTLOOK_WEEKS + 1):
+                  lo, hi = (w - 1) * 7, w * 7
+                  cols = np.where((lead_days > lo) & (lead_days <= hi))[0]
+                  if cols.size == 0: continue
+                  block = arr[:, cols]
+                  ok = np.mean(block >= threshold)
+                  med = float(np.nanmedian(block))
+                  out.append({
+                      "week": w, "horizon_days": w * 7,
+                      "as_planned": round(float(ok), 3),
+                      "med_flow": round(med, 1),
+                      "p25": round(float(np.nanpercentile(block, 25)), 1),
+                      "p75": round(float(np.nanpercentile(block, 75)), 1),
+                      "low": round(float(np.nanpercentile(block, 10)), 1),
+                      "high": round(float(np.nanpercentile(block, 90)), 1),
+                  })
+              return out
+          
+          def monthly_odds(arr, valid_months, threshold, clim):
+              """Odds the month goes 'as planned' from the ensemble where the forecast reaches,
+              else fall back to the baseline monthly climatology. valid_months: (leads,) month ints."""
+              arr = np.asarray(arr, float); vm = np.asarray(valid_months)
+              climmap = {c["m"]: c.get("as_planned") for c in clim}
+              out = []
+              seen = []
+              for off in range(0, 8):
+                  # months starting this month, going forward
+                  pass
+              # group by actual calendar month present in the forecast horizon
+              months_in_order = []
+              for m in vm:
+                  if m not in months_in_order:
+                      months_in_order.append(int(m))
+              for m in months_in_order[:8]:
+                  cols = np.where(vm == m)[0]
+                  block = arr[:, cols]
+                  src = "forecast"
+                  if cols.size >= 10:   # enough lead coverage to trust the ensemble
+                      val = round(float(np.mean(block >= threshold)), 3)
+                  else:
+                      val = climmap.get(m); src = "climatology"
+                  out.append({"month": int(m), "as_planned": val, "source": src})
+              return out
+          
+          def analog_years(dates, flow, current_flow, today_md, threshold, window=5):
+              """Find past years whose flow near today's calendar date was closest to current_flow,
+              and how they recovered over the next 60 days."""
+              dates = list(dates); flow = np.asarray(flow, float)
+              by_year = {}
+              for i, ds in enumerate(dates):
+                  y = ds[:4]; by_year.setdefault(y, []).append((ds, flow[i]))
+              tmo, tdy = int(today_md[:2]), int(today_md[3:5])
+              target = datetime.date(2000, tmo, tdy).timetuple().tm_yday
+              res = []
+              for y, rows in by_year.items():
+                  # nearest day-of-year to target within +/- window
+                  best = None
+                  for ds, fv in rows:
+                      d = datetime.date(int(ds[:4]), int(ds[5:7]), int(ds[8:10]))
+                      doy = d.timetuple().tm_yday
+                      if abs(doy - target) <= window and not math.isnan(fv):
+                          if best is None or abs(doy - target) < best[0]:
+                              best = (abs(doy - target), ds, fv, d)
+                  if not best: continue
+                  _, ds0, f0, d0 = best
+                  # next 60 days in same year
+                  nxt = [fv for (dd, fv) in rows
+                         if 0 < (datetime.date(int(dd[:4]), int(dd[5:7]), int(dd[8:10])) - d0).days <= 60
+                         and not math.isnan(fv)]
+                  min60 = round(float(min(nxt)), 1) if nxt else None
+                  # days until flow climbs back above threshold (recovery)
+                  rec = None
+                  for dd, fv in sorted(rows):
+                      d = datetime.date(int(dd[:4]), int(dd[5:7]), int(dd[8:10]))
+                      if d > d0 and not math.isnan(fv) and fv >= threshold:
+                          rec = (d - d0).days; break
+                  res.append({"year": int(y), "then_flow": round(float(f0), 1),
+                              "min_next60": min60, "recovered_in_days": rec})
+              # rank by closeness of then_flow to current_flow
+              res.sort(key=lambda r: abs(r["then_flow"] - current_flow))
+              return res[:4]
+          
+          def apply_rating(med_flow, rating):
+              """Convert a discharge (m3/s) to a gauge level (cm). rating methods:
+              {'method':'loglin','a':..,'b':..}  -> level = a*ln(flow)+b
+              {'method':'points','flow':[...],'level':[...]} -> monotonic interpolation."""
+              if rating is None or med_flow is None: return None
+              m = rating.get("method")
+              if m == "loglin":
+                  return round(rating["a"] * math.log(max(med_flow, 1.0)) + rating["b"], 1)
+              if m == "points":
+                  xs = np.asarray(rating["flow"], float); ys = np.asarray(rating["level"], float)
+                  order = np.argsort(xs); xs, ys = xs[order], ys[order]
+                  return round(float(np.interp(med_flow, xs, ys)), 1)
+              return None
+          
+          # ---------- Copernicus seasonal pull ----------
+          def seasonal_pull(cell_lat, cell_lon):
+              import cdsapi, xarray as xr
+              c = cdsapi.Client()
+              now = datetime.datetime.utcnow()
+              box = [round(cell_lat + 0.13, 3), round(cell_lon - 0.13, 3),
+                     round(cell_lat - 0.13, 3), round(cell_lon + 0.13, 3)]
+              leads = [str(h) for h in range(24, 24 * 7 * OUTLOOK_WEEKS + 1, 24)]
+              req = {
+                  "system_version": ["operational"], "hydrological_model": ["lisflood"],
+                  "variable": ["river_discharge_in_the_last_24_hours"],
+                  "year": [str(now.year)], "month": [f"{now.month:02d}"],
+                  "leadtime_hour": leads, "area": box,
+                  "data_format": "netcdf4", "download_format": "unarchived",
+              }
+              tgt = "seasonal.nc"
+              c.retrieve("cems-glofas-seasonal", req, tgt)
+              if zipfile.is_zipfile(tgt):
+                  with zipfile.ZipFile(tgt) as z:
+                      z.extractall("sx"); cand = [os.path.join("sx", n) for n in z.namelist() if n.endswith(".nc")]
+                      tgt = cand[0] if cand else tgt
+              ds = xr.open_dataset(tgt, engine="netcdf4")
+              da = ds["dis24"] if "dis24" in ds.data_vars else ds[list(ds.data_vars)[0]]
+              latn = [d for d in da.dims if "lat" in d.lower()][0]
+              lonn = [d for d in da.dims if "lon" in d.lower()][0]
+              da = da.sel({latn: cell_lat, lonn: cell_lon}, method="nearest")
+              memn = [d for d in da.dims if d not in (latn, lonn) and ("num" in d.lower() or "member" in d.lower() or "real" in d.lower())]
+              memn = memn[0] if memn else [d for d in da.dims if d != da.dims[-1]][0]
+              leadn = [d for d in da.dims if d != memn][-1]
+              arr = da.transpose(memn, leadn).values  # (members, leads)
+              # lead hours
+              lv = ds[leadn].values if leadn in ds.coords else da[leadn].values
+              lead_hours = np.array([float(np.timedelta64(x, "h") / np.timedelta64(1, "h")) if "timedelta" in str(type(x)) else float(x) for x in np.atleast_1d(lv)])
+              if lead_hours.max() < 24:  # already in days/steps; fall back to index*24
+                  lead_hours = (np.arange(arr.shape[1]) + 1) * 24.0
+              lead_days = lead_hours / 24.0
+              ref = now.date()
+              valid_months = np.array([(ref + datetime.timedelta(days=int(d))).month for d in lead_days])
+              return arr, lead_days, valid_months
+          
+          # ---------- main ----------
+          def build():
+              base = json.load(open(BASELINE))
+              gauges = base.get("gauges", base)
+              ratings = {}
+              if os.path.exists(RATINGS):
+                  try: ratings = json.load(open(RATINGS))
+                  except Exception as e: print("ratings load fail", e, flush=True)
+              today_md = datetime.datetime.utcnow().strftime("%m-%d")
+              out = {"built": datetime.datetime.utcnow().isoformat() + "Z",
+                     "horizon_weeks": HORIZON_WEEKS, "outlook_weeks": OUTLOOK_WEEKS, "gauges": {}}
+              for name, g in gauges.items():
+                  try:
+                      thr = g["threshold"]; cell = g["cell"]
+                      arr, lead_days, vm = seasonal_pull(cell[0], cell[1])
+                      wk = weekly_odds(arr, lead_days, thr)
+                      mo = monthly_odds(arr, vm, thr, g.get("monthly_climatology", []))
+                      series = g.get("series", {})
+                      cur = round(float(np.nanmedian(arr[:, :1])), 1) if arr.shape[1] else None
+                      for w in wk:
+                          w["pct_vs_normal"] = pctile_of(w["med_flow"], series.get("flow", []))
+                      ana = analog_years(series.get("dates", []), series.get("flow", []), cur or thr, today_md, thr)
+                      rec = {"river": g.get("river"), "unit": "m3/s", "threshold": thr,
+                             "current_flow": cur, "weekly": wk, "monthly": mo,
+                             "analogs": ana, "monthly_climatology": g.get("monthly_climatology", [])}
+                      r = ratings.get(name)
+                      if r:
+                          rec["heights_cm"] = [{"horizon_days": w["horizon_days"],
+                                                "level_cm": apply_rating(w["med_flow"], r),
+                                                "predicted": w["horizon_days"] > 14}
+                                               for w in wk if w["week"] <= HORIZON_WEEKS]
+                          rec["rating"] = r.get("method")
+                      out["gauges"][name] = rec
+                      print(f"{name}: cur={cur} wk={len(wk)} mo={len(mo)} analogs={len(ana)}"
+                            + (" +heights" if r else ""), flush=True)
+                  except Exception as e:
+                      print(f"{name} FAILED: {repr(e)[:200]}", flush=True)
+              os.makedirs("data", exist_ok=True)
+              json.dump(out, open("glofas.json", "w"))
+              print("wrote glofas.json gauges:", list(out["gauges"].keys()), flush=True)
+          
+          if __name__ == "__main__":
+              build()
+          PYEOF
+          python glofas.py
+      - name: Commit feed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add glofas.json
+          git commit -m "glofas feed $(date -u +%Y-%m-%dT%H:%MZ)" || echo "no change"
+          git push
