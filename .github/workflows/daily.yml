@@ -29,7 +29,7 @@ jobs:
           # GloFAS daily feed: reads data/baseline.json, pulls the seasonal ensemble per gauge,
           # and writes glofas.json (sail odds, predicted flow, analog years, monthly climatology,
           # and optional predicted heights when data/ratings.json is present).
-          import os, json, zipfile, datetime, math
+          import os, json, zipfile, datetime, math, subprocess
           import numpy as np
           
           HORIZON_WEEKS = int(os.environ.get("HORIZON_WEEKS", "8"))   # glasses go to 8 weeks
@@ -172,7 +172,7 @@ jobs:
               da = ds["dis24"] if "dis24" in ds.data_vars else ds[list(ds.data_vars)[0]]
               latn = [d for d in da.dims if "lat" in d.lower()][0]
               lonn = [d for d in da.dims if "lon" in d.lower()][0]
-              da = da.sel({latn: cell_lat, lohn: cell_lon}, method="nearest")
+              da = da.sel({latn: cell_lat, lonn: cell_lon}, method="nearest")
               memn = [d for d in da.dims if d not in (latn, lonn) and ("num" in d.lower() or "member" in d.lower() or "real" in d.lower())]
               memn = memn[0] if memn else [d for d in da.dims if d != da.dims[-1]][0]
               leadn = [d for d in da.dims if d != memn][-1]
@@ -187,18 +187,51 @@ jobs:
               valid_months = np.array([(ref + datetime.timedelta(days=int(d))).month for d in lead_days])
               return arr, lead_days, valid_months
           
+          # ---------- incremental commit (survives the slow seasonal queue) ----------
+          def git_commit(msg):
+              """Commit + push glofas.json now, so a 6h-timeout run keeps every finished gauge."""
+              try:
+                  subprocess.run(["git", "add", "glofas.json"], check=True)
+                  r = subprocess.run(["git", "commit", "-m", msg], capture_output=True, text=True)
+                  if r.returncode != 0:
+                      print("  commit:", (r.stdout + r.stderr).strip()[:120], flush=True)
+                      return
+                  subprocess.run(["git", "pull", "--rebase", "--autostash"], capture_output=True, text=True)
+                  p = subprocess.run(["git", "push"], capture_output=True, text=True)
+                  print("  pushed" if p.returncode == 0 else "  push fail: " + (p.stdout + p.stderr).strip()[:120], flush=True)
+              except Exception as e:
+                  print("  git_commit fail", repr(e)[:160], flush=True)
+
           # ---------- main ----------
           def build():
               base = json.load(open(BASELINE))
               gauges = base.get("gauges", base)
+              only = os.environ.get("GAUGES", "").strip()
+              only_set = set(x.strip() for x in only.split(",") if x.strip()) if only else None
               ratings = {}
               if os.path.exists(RATINGS):
                   try: ratings = json.load(open(RATINGS))
                   except Exception as e: print("ratings load fail", e, flush=True)
+              today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
               today_md = datetime.datetime.utcnow().strftime("%m-%d")
+              # Resume: start from any feed already committed, so a re-dispatched run
+              # skips gauges it finished today and only works the ones still missing.
               out = {"built": datetime.datetime.utcnow().isoformat() + "Z",
                      "horizon_weeks": HORIZON_WEEKS, "outlook_weeks": OUTLOOK_WEEKS, "gauges": {}}
+              if os.path.exists("glofas.json"):
+                  try:
+                      prev = json.load(open("glofas.json"))
+                      if isinstance(prev, dict):
+                          out = prev; out.setdefault("gauges", {})
+                          out["horizon_weeks"] = HORIZON_WEEKS; out["outlook_weeks"] = OUTLOOK_WEEKS
+                  except Exception as e:
+                      print("existing feed unreadable, starting fresh", e, flush=True)
               for name, g in gauges.items():
+                  if only_set and name not in only_set:
+                      continue
+                  pv = out["gauges"].get(name)
+                  if pv and pv.get("built_day") == today:
+                      print(f"{name}: already built today, skip", flush=True); continue
                   try:
                       thr = g["threshold"]; cell = g["cell"]
                       arr, lead_days, vm = seasonal_pull(cell[0], cell[1])
@@ -211,7 +244,8 @@ jobs:
                       ana = analog_years(series.get("dates", []), series.get("flow", []), cur or thr, today_md, thr)
                       rec = {"river": g.get("river"), "unit": "m3/s", "threshold": thr,
                              "current_flow": cur, "weekly": wk, "monthly": mo,
-                             "analogs": ana, "monthly_climatology": g.get("monthly_climatology", [])}
+                             "analogs": ana, "monthly_climatology": g.get("monthly_climatology", []),
+                             "built_day": today}
                       r = ratings.get(name)
                       if r:
                           rec["heights_cm"] = [{"horizon_days": w["horizon_days"],
@@ -220,19 +254,23 @@ jobs:
                                                for w in wk if w["week"] <= HORIZON_WEEKS]
                           rec["rating"] = r.get("method")
                       out["gauges"][name] = rec
+                      out["built"] = datetime.datetime.utcnow().isoformat() + "Z"
+                      json.dump(out, open("glofas.json", "w"))
+                      git_commit(f"glofas feed: {name} {today}")
                       print(f"{name}: cur={cur} wk={len(wk)} mo={len(mo)} analogs={len(ana)}"
                             + (" +heights" if r else ""), flush=True)
                   except Exception as e:
                       print(f"{name} FAILED: {repr(e)[:200]}", flush=True)
-              os.makedirs("data", exist_ok=True)
               json.dump(out, open("glofas.json", "w"))
-              print("wrote glofas.json gauges:", list(out["gauges"].keys()), flush=True)
+              print("done gauges:", list(out["gauges"].keys()), flush=True)
           
           if __name__ == "__main__":
               build()
           PYEOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           python glofas.py
-      - name: Commit feed
+      - name: Commit feed (safety net)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
