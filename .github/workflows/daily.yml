@@ -180,6 +180,7 @@ jobs:
               latn = [d for d in da.dims if "lat" in d.lower()][0]
               lonn = [d for d in da.dims if "lon" in d.lower()][0]
               da = da.sel({latn: cell_lat, lonn: cell_lon}, method="nearest")
+              da = da.squeeze(drop=True)  # drop singleton forecast_reference_time so dims = (number, forecast_period)
               memn = [d for d in da.dims if d not in (latn, lonn) and ("num" in d.lower() or "member" in d.lower() or "real" in d.lower())]
               memn = memn[0] if memn else [d for d in da.dims if d != da.dims[-1]][0]
               leadn = [d for d in da.dims if d != memn][-1]
