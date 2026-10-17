@@ -1,0 +1,89 @@
+name: GloFAS ratings (flow->level)
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  ratings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install numpy
+      - name: Build ratings
+        run: |
+          cat > ratings.py <<'PYEOF'
+          # Build per-gauge flow->level rating (level_cm = a*ln(Q)+b) from each gauge's
+          # own observed discharge (Q) + water level (W) pairs. German Rhine gauges are
+          # on PEGELONLINE (Kaub, Maxau, Koeln). Writes data/ratings.json; the daily
+          # feed reads it and emits heights_cm (predicted gauge levels) for the glasses.
+          import json, urllib.request, urllib.parse
+          import numpy as np
+
+          BASE = "https://www.pegelonline.wsv.de/webservices/rest-api/v2"
+          # feed gauge key -> PEGELONLINE station shortname
+          PEGEL = {"kaub": "KAUB", "maxau": "MAXAU", "koln": "KÖLN"}
+
+          def fetch(station, ts, days=400):
+              url = BASE + "/stations/" + urllib.parse.quote(station) + "/" + ts + \
+                    "/measurements.json?start=P" + str(days) + "D"
+              req = urllib.request.Request(url, headers={"User-Agent": "ae-glofas-ratings"})
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.load(r)
+
+          def fit(station):
+              W = fetch(station, "W"); Q = fetch(station, "Q")
+              wq = {}
+              for x in W:
+                  v = x.get("value")
+                  if v is not None:
+                      wq[x["timestamp"][:16]] = v
+              P = []
+              for x in Q:
+                  v = x.get("value"); k = x["timestamp"][:16]
+                  if v and v > 0 and k in wq:
+                      P.append((float(v), float(wq[k])))
+              if len(P) < 100:
+                  return None, len(P)
+              Qa = np.array([p[0] for p in P]); La = np.array([p[1] for p in P])
+              X = np.log(Qa)
+              a, b = np.polyfit(X, La, 1)
+              pred = a * X + b
+              ss_tot = np.sum((La - La.mean()) ** 2)
+              r2 = 1 - np.sum((La - pred) ** 2) / ss_tot if ss_tot > 0 else 0
+              tmin = min(x["timestamp"] for x in W)[:10]
+              tmax = max(x["timestamp"] for x in W)[:10]
+              return {
+                  "method": "loglin", "a": round(float(a), 4), "b": round(float(b), 2),
+                  "n": len(P), "r2": round(float(r2), 4),
+                  "q_range": [round(float(Qa.min()), 1), round(float(Qa.max()), 1)],
+                  "level_cm_range": [round(float(La.min()), 1), round(float(La.max()), 1)],
+                  "covers": [tmin, tmax], "source": "pegelonline:" + station,
+              }, len(P)
+
+          out = {}
+          for g, st in PEGEL.items():
+              try:
+                  r, n = fit(st)
+                  if r:
+                      out[g] = r
+                  print(g, (json.dumps(r) if r else ("too few pairs: " + str(n))), flush=True)
+              except Exception as e:
+                  print(g, "FAIL", repr(e)[:200], flush=True)
+
+          import os
+          os.makedirs("data", exist_ok=True)
+          json.dump(out, open("data/ratings.json", "w"), indent=1)
+          print("wrote data/ratings.json gauges:", list(out.keys()), flush=True)
+          PYEOF
+          python ratings.py
+      - name: Commit ratings
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ratings.json
+          git commit -m "ratings.json $(date -u +%Y-%m-%dT%H:%MZ)" || echo "no change"
+          git push
