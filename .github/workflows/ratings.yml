@@ -74,6 +74,15 @@ jobs:
               except Exception as e:
                   print(g, "FAIL", repr(e)[:200], flush=True)
 
+          # Basel (BAFU) and Lobith (Rijkswaterstaat) do not expose a reachable
+          # level-vs-flow history (Basel's open feed is flow-only; Lobith needs a
+          # POST pipeline). The glasses anchor the intercept to the live daily
+          # reading, so only the SLOPE (cm per ln m3/s) is needed to extend the
+          # forecast on GloFAS flow. Estimated slopes by river reach (upper vs
+          # lower Rhine), bracketed by the fitted German gauges (kaub 114 -> koln 183).
+          out.setdefault("basel",  {"method": "loglin", "a": 150.0, "b": 0.0, "source": "estimate:upper-rhine"})
+          out.setdefault("lobith", {"method": "loglin", "a": 175.0, "b": 0.0, "source": "estimate:lower-rhine"})
+
           import os
           os.makedirs("data", exist_ok=True)
           json.dump(out, open("data/ratings.json", "w"), indent=1)
