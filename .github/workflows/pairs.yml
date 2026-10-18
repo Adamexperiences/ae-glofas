@@ -1,4 +1,4 @@
-name: GloFAS pairs logger
+name: GloFAS pairs logger (Budapest)
 on:
   workflow_dispatch:
   schedule:
@@ -13,29 +13,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Append daily GloFAS-flow / observed-stage pairs
+      - name: Append daily Budapest (GloFAS flow, observed stage) pair
         run: |
           python3 - <<'PY'
-          import json, urllib.request, datetime, os, csv
-          UA={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36','Accept':'application/json'}
-          def g(u):
-              return json.load(urllib.request.urlopen(urllib.request.Request(u,headers=UA),timeout=60))
-          gl=g('https://raw.githubusercontent.com/Adamexperiences/ae-glofas/main/glofas.json').get('gauges',{})
-          try:
-              ob=g('https://amsterdamexperiences.nl/wp-json/ae/v1/danube').get('gauges',{})
-          except Exception as e:
-              print('obs fetch failed:', repr(e)[:160]); ob={}
+          import json, urllib.request, datetime, os, csv, re
+          UA={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+          def get(u):
+              return urllib.request.urlopen(urllib.request.Request(u,headers=UA),timeout=60).read().decode('utf-8','replace')
+          gl=json.loads(get('https://raw.githubusercontent.com/Adamexperiences/ae-glofas/main/glofas.json'))
+          flow=gl.get('gauges',{}).get('budapest',{}).get('current_flow')
+          html=get('https://www.danubeportal.com/en/waterLevel/details/HUBUD00001G001516465')
+          m=re.search(r'BUDAPEST</td>\s*<td>Duna</td>\s*<td>[^<]*</td>\s*<td>\d+</td>\s*<td>\d+</td>\s*<td>[^<]*</td>\s*<td>\s*(-?\d+)\s*</td>', html)
+          cm=int(m.group(1)) if m else None
           t=datetime.date.today().isoformat(); p='data/pairs.csv'; new=not os.path.exists(p)
-          rows=[[t,n,gl[n].get('current_flow'),ob[n].get('cm')] for n in gl if n in ob and ob[n].get('cm') is not None and gl[n].get('current_flow') is not None]
-          if rows:
+          if flow is not None and cm is not None:
               f=open(p,'a',newline=''); w=csv.writer(f)
-              if new: w.writerow(['date','gauge','glofas_flow_m3s','obs_stage_cm'])
-              w.writerows(rows); f.close()
-          print('logged', len(rows), 'pairs for', t)
+              if new: w.writerow(['date','gauge','glofas_flow_m3s','obs_stage_cm','source'])
+              w.writerow([t,'budapest',flow,cm,'danubeportal']); f.close()
+              print('logged budapest flow=%s cm=%s' % (flow, cm))
+          else:
+              print('skip: flow=%s cm=%s' % (flow, cm))
           PY
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/pairs.csv || true
-          git commit -m "pairs: $(date -u +%Y-%m-%d)" || echo "no change"
+          git commit -m "pairs: budapest $(date -u +%Y-%m-%d)" || echo "no change"
           git pull --rebase --autostash || true
           git push || true
