@@ -46,10 +46,13 @@ jobs:
                   z.extractall("fx"); cand=[os.path.join("fx",n) for n in z.namelist() if n.endswith(".nc")]
                   tgt=cand[0] if cand else tgt
           ds=xr.open_dataset(tgt, engine="netcdf4")
-          da=ds["dis24"] if "dis24" in ds.data_vars else ds[list(ds.data_vars)[0]]
-          latn=[d for d in da.dims if "lat" in d.lower()][0]
-          lonn=[d for d in da.dims if "lon" in d.lower()][0]
-          da=da.sel({latn:CELL[0], lonn:CELL[1]}, method="nearest")
+          da=ds["dis24"] if "dis24" in ds.data_vars else ds[sorted(ds.data_vars, key=lambda v:-len(ds[v].dims))[0]]
+          latd=[d for d in da.dims if "lat" in d.lower()]
+          lond=[d for d in da.dims if "lon" in d.lower()]
+          if latd and lond:
+              da=da.sel({latd[0]:CELL[0], lond[0]:CELL[1]}, method="nearest")
+          else:
+              for d in (latd+lond): da=da.isel({d:0})
           dims=list(da.dims); leadn=dims[-1]
           arr=da.transpose(*[d for d in dims if d!=leadn], leadn).values
           arr=arr.reshape(-1, arr.shape[-1])
