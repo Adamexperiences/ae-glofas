@@ -56,8 +56,9 @@ jobs:
           import pandas as pd
           print("DIMS", list(da.dims), "COORDS", list(ds.coords), flush=True)
           dims=list(da.dims)
-          cand=[d for d in dims if any(k in d.lower() for k in ("step","lead","time","valid","forecast"))]
-          leadn=cand[0] if cand else dims[-1]
+          memn=[d for d in dims if any(k in d.lower() for k in ("number","realiz","ensemble","member"))]
+          rest=[d for d in dims if d not in memn]
+          leadn=max(rest, key=lambda d: da.sizes[d]) if rest else dims[-1]
           arr=da.transpose(*[d for d in dims if d!=leadn], leadn).values
           arr=arr.reshape(-1, arr.shape[-1]) if getattr(arr,"ndim",1)>1 else arr.reshape(1,-1)
           lv=np.atleast_1d(ds[leadn].values if leadn in ds.coords else da[leadn].values)
@@ -70,6 +71,7 @@ jobs:
               ld.append(float(x))
           ld=np.array(ld, dtype=float)
           if np.nanmax(ld)>60: ld=ld/24.0
+          if np.nanmax(ld)<2: ld=np.arange(len(ld),dtype=float)+1.0
           print("LEADN", leadn, "ld", [round(float(v),2) for v in ld[:12]], "max", float(np.nanmax(ld)), flush=True)
           out={"built":now.isoformat()+"Z","init_date":init.date().isoformat(),"gauge":"budapest","weekly":[]}
           for w in range(1,6):
