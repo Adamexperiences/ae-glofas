@@ -95,7 +95,7 @@ jobs:
                   cols = np.where(vm == m)[0]
                   block = arr[:, cols]
                   src = "forecast"
-                  if cols.size >= 3:   # enough lead coverage to trust the ensemble
+                  if cols.size >= 1:   # enough lead coverage to trust the ensemble
                       val = round(float(np.mean(block >= threshold)), 3)
                   else:
                       val = climmap.get(m); src = "climatology"
