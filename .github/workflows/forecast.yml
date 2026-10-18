@@ -1,0 +1,74 @@
+name: GloFAS 30-day forecast (Budapest)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 6 * * *"
+permissions:
+  contents: write
+concurrency:
+  group: glofas-mr
+  cancel-in-progress: false
+jobs:
+  mr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install "cdsapi>=0.7.7" xarray "netcdf4" numpy
+      - name: CDS config
+        env:
+          CDS_KEY: ${{ secrets.CDS_KEY }}
+        run: |
+          printf 'url: https://ewds.climate.copernicus.eu/api\nkey: %s\n' "$CDS_KEY" > "$HOME/.cdsapirc"
+      - name: Pull medium-range forecast for Budapest
+        run: |
+          python3 - <<'PY'
+          import os, json, zipfile, datetime
+          import numpy as np
+          import cdsapi, xarray as xr
+          CELL=[47.475, 19.075]
+          now=datetime.datetime.utcnow()
+          init=now - datetime.timedelta(days=1)
+          box=[round(CELL[0]+0.03,3), round(CELL[1]-0.03,3), round(CELL[0]-0.03,3), round(CELL[1]+0.03,3)]
+          leads=[str(h) for h in range(24, 721, 24)]
+          req={"system_version":["operational"],"hydrological_model":["lisflood"],
+               "product_type":["ensemble_perturbed_forecasts","control_forecast"],
+               "variable":["river_discharge_in_the_last_24_hours"],
+               "year":[str(init.year)],"month":["%02d"%init.month],"day":["%02d"%init.day],
+               "leadtime_hour":leads,"area":box,"data_format":"netcdf4","download_format":"unarchived"}
+          tgt="fc.nc"
+          cdsapi.Client().retrieve("cems-glofas-forecast", req, tgt)
+          if zipfile.is_zipfile(tgt):
+              with zipfile.ZipFile(tgt) as z:
+                  z.extractall("fx"); cand=[os.path.join("fx",n) for n in z.namelist() if n.endswith(".nc")]
+                  tgt=cand[0] if cand else tgt
+          ds=xr.open_dataset(tgt, engine="netcdf4")
+          da=ds["dis24"] if "dis24" in ds.data_vars else ds[list(ds.data_vars)[0]]
+          latn=[d for d in da.dims if "lat" in d.lower()][0]
+          lonn=[d for d in da.dims if "lon" in d.lower()][0]
+          da=da.sel({latn:CELL[0], lonn:CELL[1]}, method="nearest")
+          dims=list(da.dims); leadn=dims[-1]
+          arr=da.transpose(*[d for d in dims if d!=leadn], leadn).values
+          arr=arr.reshape(-1, arr.shape[-1])
+          lv=ds[leadn].values if leadn in ds.coords else da[leadn].values
+          lh=np.array([float(np.timedelta64(x,"h")/np.timedelta64(1,"h")) if "timedelta" in str(type(x)) else float(x) for x in np.atleast_1d(lv)])
+          if lh.max()<24: lh=(np.arange(arr.shape[1])+1)*24.0
+          ld=lh/24.0
+          out={"built":now.isoformat()+"Z","init_date":init.date().isoformat(),"gauge":"budapest","weekly":[]}
+          for w in range(1,6):
+              cols=np.where((ld>(w-1)*7)&(ld<=w*7))[0]
+              if cols.size==0: continue
+              b=arr[:,cols]
+              out["weekly"].append({"week":w,"horizon_days":w*7,"med_flow":round(float(np.nanmedian(b)),1),"p25":round(float(np.nanpercentile(b,25)),1),"p75":round(float(np.nanpercentile(b,75)),1)})
+          json.dump(out, open("budapest_mr.json","w"))
+          print("wrote", len(out["weekly"]), "weeks; init", init.date())
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add budapest_mr.json || true
+          git commit -m "mr: budapest $(date -u +%Y-%m-%d)" || echo "no change"
+          git pull --rebase --autostash || true
+          git push || true
