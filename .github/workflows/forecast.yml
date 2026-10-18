@@ -53,13 +53,24 @@ jobs:
               da=da.sel({latd[0]:CELL[0], lond[0]:CELL[1]}, method="nearest")
           else:
               for d in (latd+lond): da=da.isel({d:0})
-          dims=list(da.dims); leadn=dims[-1]
+          import pandas as pd
+          print("DIMS", list(da.dims), "COORDS", list(ds.coords), flush=True)
+          dims=list(da.dims)
+          cand=[d for d in dims if any(k in d.lower() for k in ("step","lead","time","valid","forecast"))]
+          leadn=cand[0] if cand else dims[-1]
           arr=da.transpose(*[d for d in dims if d!=leadn], leadn).values
-          arr=arr.reshape(-1, arr.shape[-1])
-          lv=ds[leadn].values if leadn in ds.coords else da[leadn].values
-          lh=np.array([float(np.timedelta64(x,"h")/np.timedelta64(1,"h")) if "timedelta" in str(type(x)) else float(x) for x in np.atleast_1d(lv)])
-          if lh.max()<24: lh=(np.arange(arr.shape[1])+1)*24.0
-          ld=lh/24.0
+          arr=arr.reshape(-1, arr.shape[-1]) if getattr(arr,"ndim",1)>1 else arr.reshape(1,-1)
+          lv=np.atleast_1d(ds[leadn].values if leadn in ds.coords else da[leadn].values)
+          ld=[]
+          for x in lv:
+              try: ld.append(pd.Timedelta(x).total_seconds()/86400.0); continue
+              except Exception: pass
+              try: ld.append(float((np.datetime64(x)-np.datetime64(init))/np.timedelta64(1,"D"))); continue
+              except Exception: pass
+              ld.append(float(x))
+          ld=np.array(ld, dtype=float)
+          if np.nanmax(ld)>60: ld=ld/24.0
+          print("LEADN", leadn, "ld", [round(float(v),2) for v in ld[:12]], "max", float(np.nanmax(ld)), flush=True)
           out={"built":now.isoformat()+"Z","init_date":init.date().isoformat(),"gauge":"budapest","weekly":[]}
           for w in range(1,6):
               cols=np.where((ld>(w-1)*7)&(ld<=w*7))[0]
