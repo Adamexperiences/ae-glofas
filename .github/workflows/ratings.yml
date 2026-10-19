@@ -1,6 +1,9 @@
 name: GloFAS ratings (flow->level)
 on:
   workflow_dispatch:
+  schedule:
+    # monthly rating refit, 12th 06:20 UTC (after seasonal 11th + daily pairs/forecast)
+    - cron: "20 6 12 * *"
 permissions:
   contents: write
 jobs:
