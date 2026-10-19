@@ -7,7 +7,7 @@ on:
         required: false
         default: ""
   schedule:
-    - cron: "20 5 * * *"
+    - cron: "0 6 11-15 * *"
 permissions:
   contents: write
 concurrency:
